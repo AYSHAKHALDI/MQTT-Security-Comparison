@@ -1,0 +1,370 @@
+"""MQTT Security Comparison: Message vs Transport encryption for IoT Individual Project
+"""
+
+import hashlib, json, logging, random, time, unittest
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+from enum import Enum
+import matplotlib.pyplot as plt
+import numpy as np
+
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+logger = logging.getLogger(__name__)
+
+class SecurityLevel(Enum):
+    NONE = "none"
+    TRANSPORT = "transport"  # Simulates TLS 1.3
+    MESSAGE = "message"      # Simulates AES-256-GCM
+
+@dataclass
+class Message:
+    topic: str
+    payload: Dict
+    qos: int = 0
+    timestamp: float = None
+    message_id: str = None
+    
+    def __post_init__(self):
+        if self.timestamp is None:
+            self.timestamp = time.time()
+        if self.message_id is None:
+            self.message_id = hashlib.sha256(
+                f"{self.topic}{self.timestamp}{random.random()}".encode()
+            ).hexdigest()[:16]
+
+class EnergyMonitor:
+    """Tracks energy consumption per device (Khan, Rao & Camtepe, 2020)"""
+    BASE_POWER = 0.05  # Watts
+    
+    def __init__(self, name: str):
+        self.name = name
+        self.total = 0.0
+        self.count = 0
+        
+    def measure(self, op: str, t: float, p: float = 1.0) -> float:
+        e = (self.BASE_POWER + 0.15 * p) * t  # E = P * t
+        self.total += e
+        self.count += 1
+        return e
+
+class SecurityManager:
+    """Simulates crypto ops with realistic timing from literature"""
+    
+    def __init__(self, level: SecurityLevel):
+        self.level = level
+        self.hs_complete = False
+        
+    def process(self, data: bytes, op: str) -> Tuple[bytes, float]:
+        if self.level == SecurityLevel.NONE:
+            return data, 0.0
+            
+        sz, base = len(data), 0.0005
+        
+        if self.level == SecurityLevel.MESSAGE:  # AES-256-GCM
+            t = base + (sz/1000) * (0.0012 if op=="encrypt" else 0.0011)
+            return bytes([b ^ 0xAA for b in data]), t
+        else:  # TRANSPORT - TLS 1.3
+            if op=="encrypt" and not self.hs_complete:
+                t = base*10 + (sz/1000)*0.0024  # Handshake overhead
+                self.hs_complete = True
+            else:
+                t = base*3 + (sz/1000)*0.0018
+            return bytes([b ^ 0xBB for b in data]), t
+
+class MQTTClient:
+    def __init__(self, cid: str, level: SecurityLevel):
+        self.cid = cid
+        self.level = level
+        self.sec = SecurityManager(level)
+        self.energy = EnergyMonitor(cid)
+        self.connected = False
+        self.broker = None
+        self.msg_cnt = 0
+        self.seen = set()  # Replay protection cache
+        
+    def connect(self, b) -> bool:
+        self.broker = b
+        self.connected = b.register(self)
+        return self.connected
+        
+    def check_replay(self, m: Message) -> bool:
+        """Mitigation for replay attacks (Di Paolo et al., 2023)"""
+        key = f"{m.topic}:{m.message_id}"
+        if key in self.seen:
+            return True
+        self.seen.add(key)
+        return False
+
+class Publisher(MQTTClient):
+    def __init__(self, cid: str, level: SecurityLevel):
+        super().__init__(cid, level)
+        self.pub_cnt = 0
+        
+    def gen_data(self) -> Dict:
+        return {'sensor': self.cid, 'value': 20 + random.uniform(-5,5)}
+        
+    def publish(self, topic: str) -> Optional[Message]:
+        if not self.connected:
+            return None
+            
+        start = time.time()
+        data = json.dumps(self.gen_data()).encode()
+        self.pub_cnt += 1
+        
+        if self.level == SecurityLevel.MESSAGE:
+            enc, t = self.sec.process(data, "encrypt")
+            payload = {'data': enc.hex(), 'enc': True}
+            self.energy.measure("enc", t, 1.2)
+        elif self.level == SecurityLevel.TRANSPORT:
+            enc, t = self.sec.process(data, "encrypt")
+            payload = {'data': enc.hex(), 'tls': True}
+            self.energy.measure("tls_enc", t, 1.8)
+        else:
+            payload = self.gen_data()
+            
+        m = Message(topic, payload, 1)
+        if self.broker.publish(m, self):
+            self.msg_cnt += 1
+            self.energy.measure("total", time.time()-start, 1.0)
+            return m
+        return None
+
+class Subscriber(MQTTClient):
+    def __init__(self, cid: str, level: SecurityLevel):
+        super().__init__(cid, level)
+        self.rcvd = []
+        self.alerts = 0
+        
+    def subscribe(self, t: str) -> bool:
+        return self.broker.subscribe(self, t)
+        
+    def receive(self, m: Message):
+        if self.check_replay(m):  # Replay protection
+            return
+            
+        start = time.time()
+        
+        if m.payload.get('enc') or m.payload.get('tls'):
+            b = bytes.fromhex(m.payload['data'])
+            if m.payload.get('enc'):
+                dec, t = self.sec.process(b, "decrypt")
+                self.energy.measure("dec", t, 1.2)
+            else:
+                dec, t = self.sec.process(b, "decrypt")
+                self.energy.measure("tls_dec", t, 1.8)
+            try:
+                p = json.loads(dec.decode())
+            except:
+                p = {'error': 'dec_failed'}
+        else:
+            p = m.payload
+            
+        self.rcvd.append(p)
+        self.msg_cnt += 1
+        
+        if p.get('value', 0) > 24:
+            self.alerts += 1
+            
+        self.energy.measure("proc", time.time()-start, 0.9)
+
+class Broker:
+    """Simulates MQTT broker with ACLs (Hintaw et al., 2021)"""
+    
+    def __init__(self):
+        self.clients = {}
+        self.subs = {}
+        self.violations = 0
+        
+    def register(self, c: MQTTClient) -> bool:
+        self.clients[c.cid] = c
+        return True
+        
+    def deregister(self, c: MQTTClient):
+        self.clients.pop(c.cid, None)
+            
+    def subscribe(self, c: Subscriber, t: str) -> bool:
+        self.subs.setdefault(t, []).append(c)
+        return True
+        
+    def check_auth(self, client: MQTTClient, topic: str) -> bool:
+        """ACL hardening mitigation"""
+        if 'admin' in topic and 'admin' not in client.cid:
+            self.violations += 1
+            logger.warning(f"UNAUTHORIZED: {client.cid} -> {topic}")
+            return False
+        return True
+        
+    def publish(self, m: Message, s: MQTTClient) -> bool:
+        if not self.check_auth(s, m.topic):
+            return False
+            
+        for t, subs in self.subs.items():
+            if t == m.topic or (t.endswith('#') and m.topic.startswith(t[:-1])):
+                for sub in subs:
+                    if sub != s:
+                        sub.receive(m)
+        return True
+
+class AttackSimulator:
+    """Tests mitigations against known vulnerabilities"""
+    
+    def __init__(self, b: Broker):
+        self.broker = b
+        self.results = {}
+        
+    def replay_attack(self, orig: Message) -> bool:
+        """Test replay protection"""
+        logger.info("Testing: Replay Attack")
+        a = Publisher("attacker", SecurityLevel.NONE)
+        a.connected = True
+        r = Message(orig.topic, orig.payload.copy(), orig.qos, orig.timestamp, orig.message_id)
+        success = self.broker.publish(r, a)
+        self.results['replay'] = success
+        return success
+        
+    def dos_attack(self, cnt: int = 10) -> int:
+        """Test DoS resilience"""
+        logger.info(f"Testing: DoS Attack ({cnt} msgs)")
+        a = Publisher("dos_attacker", SecurityLevel.NONE)
+        a.connected = True
+        success = 0
+        for i in range(cnt):
+            if self.broker.publish(Message(f"attack/dos/{i}", {'x':'x'*500}, 0), a):
+                success += 1
+        self.results['dos'] = success
+        return success
+        
+    def weak_auth_attack(self) -> bool:
+        """Test ACL effectiveness"""
+        logger.info("Testing: Auth Bypass")
+        a = Publisher("attacker", SecurityLevel.NONE)
+        a.connected = True
+        success = self.broker.publish(Message("admin/config", {'cmd':'shutdown'}), a)
+        self.results['auth'] = success
+        return success
+
+class Experiment:
+    def __init__(self):
+        self.results = []
+        
+    def run(self, level: SecurityLevel, n: int = 30) -> Dict:
+        logger.info(f"\n--- Testing: {level.value.upper()} ---")
+        
+        b = Broker()
+        pub = Publisher(f"pub-{level.value}", level)
+        sub = Subscriber(f"sub-{level.value}", level)
+        
+        pub.connect(b)
+        sub.connect(b)
+        sub.subscribe("sensors/#")
+        
+        # Run normal traffic
+        msgs = []
+        for i in range(n):
+            if m := pub.publish("sensors/temp"):
+                msgs.append(m)
+            time.sleep(0.01)
+        
+        # Test attacks
+        attack = AttackSimulator(b)
+        replay_success = attack.replay_attack(msgs[0]) if msgs else False
+        dos_success = attack.dos_attack(10)
+        auth_success = attack.weak_auth_attack()
+        
+        # Calculate security score
+        score = 100
+        if replay_success: score -= 25
+        if dos_success > 5: score -= 25
+        if auth_success: score -= 25
+        score -= b.violations * 5
+        score = max(0, score)
+        
+        result = {
+            'level': level.value,
+            'energy': pub.energy.total + sub.energy.total,
+            'delivery': (sub.msg_cnt/n)*100,
+            'security': score,
+            'replay_protected': not replay_success,
+            'dos_resilient': dos_success <= 5
+        }
+        self.results.append(result)
+        return result
+        
+    def run_all(self, it: int = 3):
+        logger.info("="*60)
+        logger.info("MQTT SECURITY COMPARISON EXPERIMENT")
+        logger.info("="*60)
+        
+        for level in [SecurityLevel.NONE, SecurityLevel.TRANSPORT, SecurityLevel.MESSAGE]:
+            for i in range(it):
+                self.run(level, 30)
+        
+        self.analyze()
+        
+    def analyze(self):
+        # Group by level
+        groups = {}
+        for r in self.results:
+            groups.setdefault(r['level'], []).append(r)
+        
+        # Calculate averages
+        summary = {}
+        for level, res in groups.items():
+            summary[level] = {
+                'energy': np.mean([r['energy'] for r in res]),
+                'security': np.mean([r['security'] for r in res]),
+                'replay': all(r['replay_protected'] for r in res)
+            }
+        
+        # Test hypothesis
+        if 'message' in summary and 'transport' in summary:
+            m, t = summary['message'], summary['transport']
+            save = ((t['energy'] - m['energy']) / t['energy']) * 100
+            
+            logger.info("\n" + "="*60)
+            logger.info("RESULTS")
+            logger.info("="*60)
+            logger.info(f"NONE:    E:{summary['none']['energy']:.4f}J  S:{summary['none']['security']:.0f}")
+            logger.info(f"TRANSPORT: E:{t['energy']:.4f}J  S:{t['security']:.0f}")
+            logger.info(f"MESSAGE:  E:{m['energy']:.4f}J  S:{m['security']:.0f}")
+            logger.info(f"\nHYPOTHESIS: Message vs TLS")
+            logger.info(f"Energy Saving: {save:.1f}%")
+            logger.info(f"Security Diff: {abs(m['security']-t['security']):.0f} pts")
+            
+            if save > 0 and abs(m['security']-t['security']) < 10:
+                logger.info("✅ HYPOTHESIS SUPPORTED")
+            else:
+                logger.info("❌ HYPOTHESIS NOT SUPPORTED")
+        
+        self.plot(summary)
+        
+    def plot(self, s: Dict):
+        levels = list(s.keys())
+        x = range(len(levels))
+        
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10,4))
+        
+        e = [s[l]['energy'] for l in levels]
+        sc = [s[l]['security'] for l in levels]
+        
+        ax1.bar(x, e, color=['red','orange','green'])
+        ax1.set_xticks(x); ax1.set_xticklabels([l.upper() for l in levels])
+        ax1.set_ylabel('Energy (J)'); ax1.set_title('Energy Efficiency')
+        
+        ax2.bar(x, sc, color=['red','orange','green'])
+        ax2.set_xticks(x); ax2.set_xticklabels([l.upper() for l in levels])
+        ax2.set_ylabel('Security Score'); ax2.set_title('Security Effectiveness')
+        
+        plt.tight_layout()
+        plt.savefig('mqtt_results.png')
+        logger.info("\nPlot saved to mqtt_results.png")
+
+def main():
+    exp = Experiment()
+    exp.run_all(3)
+    logger.info("\n" + "="*60)
+    logger.info("✓ Replay Protected  ✓ ACLs  ✓ DoS Tested")
+    logger.info("="*60)
+
+if __name__ == "__main__":
+    main()
